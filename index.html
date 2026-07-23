@@ -484,6 +484,8 @@ form.addEventListener('submit', async (e) => {
       body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error('bad status');
+    const data = await res.json().catch(() => ({}));
+    if (String(data.success) !== 'true') throw new Error(data.message || 'not delivered');
     form.style.display = 'none';
     document.getElementById('formMsg').style.display = 'block';
     if (META_PIXEL_ID && window.fbq) fbq('track', 'Lead');
