@@ -432,14 +432,22 @@
 
 <script>
 /* ================= CONFIG =================
-   FORM_ENDPOINT: FormSubmit AJAX endpoint. IMPORTANT: the first submission
-   triggers a one-time activation email to sales@velocityprosims.com — click
-   the link in it once, and every submission after that is delivered.
-   META_PIXEL_ID: paste your Facebook/Meta Pixel ID (numbers only) to enable
-   PageView + Lead tracking for the ad campaign. Leave "" to disable.
+   Leads flow into the SAME event request pipeline as velocityprosims.com:
+   1. Firestore `pipelineQuotes` (velocity-pro-sims-sop) — shows in the SOP
+      app tagged as a UTAH Interest request, and triggers the existing
+      push-notification cloud function.
+   2. EmailJS template "UTAH Interest Lead" (template_vpyuizc) — emails
+      sales@velocityprosims.com AND jcc@westsimrentals.com.
+   3. FormSubmit stays as a BACKUP email path only if EmailJS fails.
+   META_PIXEL_ID: Facebook Pixel — PageView + Lead events.
 ============================================ */
-const FORM_ENDPOINT = "https://formsubmit.co/ajax/sales@velocityprosims.com";
+const FORM_ENDPOINT = "https://formsubmit.co/ajax/sales@velocityprosims.com"; // backup only
 const META_PIXEL_ID = "317411998732190";
+const FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/velocity-pro-sims-sop/databases/(default)/documents/pipelineQuotes?key=AIzaSyDHKg7eVImJnhuV1r2SM3BhmH1zToDoXkg";
+const EMAILJS_URL = "https://api.emailjs.com/api/v1.0/email/send";
+const EMAILJS_SERVICE = "service_e8quu9b";
+const EMAILJS_TEMPLATE = "template_vpyuizc";
+const EMAILJS_PUBLIC_KEY = "ea3jgX2jgaRfO2JyK";
 
 /* ---- Meta Pixel (only injected when an ID is set) ---- */
 if (META_PIXEL_ID) {
@@ -452,7 +460,15 @@ if (META_PIXEL_ID) {
   fbq('track', 'PageView');
 }
 
-/* ---- Lead form ---- */
+/* ---- Lead form → pipeline + UTAH Interest emails ---- */
+function utahRef() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let r = 'UTH-';
+  for (let i = 0; i < 6; i++) r += chars.charAt(Math.floor(Math.random() * chars.length));
+  return r;
+}
+const sv = v => ({ stringValue: String(v == null ? '' : v) });
+
 const form = document.getElementById('leadForm');
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -462,34 +478,108 @@ form.addEventListener('submit', async (e) => {
   err.style.display = 'none';
   btn.disabled = true;
   btn.textContent = 'Sending…';
+
   const fd = new FormData(form);
-  const payload = {
-    _subject: '🏁 New UTAH event lead — Velocity Pro Sims',
-    _template: 'table',
-    _captcha: 'false',
-    name: fd.get('name'),
-    email: fd.get('email'),
-    phone: fd.get('phone') || '—',
-    event_type: fd.get('event_type'),
-    rough_date: fd.get('rough_date') || '—',
-    city: fd.get('city') || '—',
-    message: fd.get('message') || '—',
-    source: 'Utah Facebook ad landing page',
-    _honey: fd.get('_honey')
+  if (fd.get('_honey')) { btn.disabled = false; btn.textContent = 'Check Availability →'; return; }
+  const lead = {
+    name: (fd.get('name') || '').trim(),
+    email: (fd.get('email') || '').trim(),
+    phone: (fd.get('phone') || '').trim(),
+    type: fd.get('event_type') || 'Not specified',
+    date: (fd.get('rough_date') || '').trim(),
+    city: (fd.get('city') || '').trim(),
+    msg: (fd.get('message') || '').trim()
   };
-  try {
-    const res = await fetch(FORM_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) throw new Error('bad status');
-    const data = await res.json().catch(() => ({}));
-    if (String(data.success) !== 'true') throw new Error(data.message || 'not delivered');
+  const ref = utahRef();
+  const nowIso = new Date().toISOString();
+  const msgText =
+    'UTAH INTEREST REQUEST (Utah landing page)\n\n' +
+    'Reference: ' + ref + '\n' +
+    'Submitted: ' + new Date().toLocaleString() + '\n\n' +
+    'Name: ' + lead.name + '\n' +
+    'Email: ' + lead.email + '\n' +
+    'Phone: ' + (lead.phone || '—') + '\n' +
+    'Event Type: ' + lead.type + '\n' +
+    'Rough Date: ' + (lead.date || '—') + '\n' +
+    'City/Area: ' + (lead.city || '—') + ', UT\n' +
+    'Notes: ' + (lead.msg || '—');
+
+  /* Same shape as the site quote form writes, plus UTAH source tags.
+     `name`/`eventType` are included so the existing push-notification
+     cloud function labels it correctly. */
+  const pipelineDoc = { fields: {
+    clientName: sv(lead.name),
+    clientEmail: sv(lead.email),
+    clientPhone: sv(lead.phone),
+    clientCity: sv(lead.city),
+    clientState: sv('UT'),
+    eventName: sv('UTAH Interest — ' + lead.type),
+    eventDescription: sv(lead.msg),
+    notes: sv('Rough date: ' + (lead.date || '—') + ' · Short interest form from the Utah landing page (no venue details collected).'),
+    roughDate: sv(lead.date),
+    status: sv('new'),
+    createdAt: sv(nowIso),
+    refNumber: sv(ref),
+    sourceSite: sv('Utah Landing Page'),
+    sourceSiteKey: sv('utahlanding'),
+    name: sv(lead.name),
+    eventType: sv('UTAH Interest — ' + lead.type),
+    source: { mapValue: { fields: {
+      site: sv('Utah Landing Page'),
+      siteKey: sv('utahlanding'),
+      method: sv('landing'),
+      hostname: sv(location.hostname),
+      detectedAt: sv(nowIso)
+    } } }
+  } };
+
+  const emailPayload = {
+    service_id: EMAILJS_SERVICE,
+    template_id: EMAILJS_TEMPLATE,
+    user_id: EMAILJS_PUBLIC_KEY,
+    template_params: {
+      client_name: lead.name,
+      event_type: lead.type,
+      message: msgText,
+      reply_to: lead.email || 'sales@velocityprosims.com',
+      ref_number: ref
+    }
+  };
+
+  const [pipeRes, mailRes] = await Promise.allSettled([
+    fetch(FIRESTORE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pipelineDoc) }),
+    fetch(EMAILJS_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(emailPayload) })
+  ]);
+  const pipeOk = pipeRes.status === 'fulfilled' && pipeRes.value.ok;
+  const mailOk = mailRes.status === 'fulfilled' && mailRes.value.ok;
+
+  /* Backup email path if EmailJS didn't go through */
+  let backupOk = false;
+  if (!mailOk) {
+    try {
+      const res = await fetch(FORM_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          _subject: '🟢 UTAH Interest — ' + lead.name + ' (' + lead.type + ')',
+          _template: 'table', _captcha: 'false',
+          reference: ref, name: lead.name, email: lead.email, phone: lead.phone || '—',
+          event_type: lead.type, rough_date: lead.date || '—', city: lead.city || '—',
+          message: lead.msg || '—', source: 'Utah landing page (backup path)'
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      backupOk = res.ok && String(data.success) === 'true';
+    } catch (_) {}
+  }
+
+  if (pipeOk || mailOk || backupOk) {
     form.style.display = 'none';
     document.getElementById('formMsg').style.display = 'block';
     if (META_PIXEL_ID && window.fbq) fbq('track', 'Lead');
-  } catch (_) {
+    if (!pipeOk) console.warn('Pipeline write failed for', ref);
+    if (!mailOk) console.warn('EmailJS failed for', ref, '— backup:', backupOk);
+  } else {
     err.style.display = 'block';
     btn.disabled = false;
     btn.textContent = 'Check Availability →';
